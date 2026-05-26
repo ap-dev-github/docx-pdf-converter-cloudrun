@@ -42,9 +42,9 @@ app.use(express.json());
 
 // Logger with context
 const createLogger = (uuid) => ({
-  info: (msg, data) => console.log(`[${uuid}] ℹ️  ${msg}`, data ? JSON.stringify(data) : ''),
-  error: (msg, err) => console.error(`[${uuid}] ❌ ${msg}`, err ? err.message : ''),
-  success: (msg) => console.log(`[${uuid}] ✅ ${msg}`)
+  info: (msg, data) => console.log(`[${uuid}] ℹ ${msg}`, data ? JSON.stringify(data) : ''),
+  error: (msg, err) => console.error(`[${uuid}]  ${msg}`, err ? err.message : ''),
+  success: (msg) => console.log(`[${uuid}] ${msg}`)
 });
 
 /**
@@ -80,9 +80,9 @@ async function updateConversionStatus(uuid, status, error) {
     }
 
     const result = await response.json();
-    console.log(`[${uuid}] ✅ Status updated in D1:`, result);
+    console.log(`[${uuid}] Status updated in D1:`, result);
   } catch (err) {
-    console.error(`[${uuid}] ❌ Failed to update status in D1:`, err.message);
+    console.error(`[${uuid}] Failed to update status in D1:`, err.message);
   }
 }
 
@@ -237,18 +237,12 @@ async function processConversion(payload) {
 }
 
 /**
- * Pub/Sub message handler (push subscription)
+ * Incoming process file request handler
  */
-app.post('/process-batch', async (req, res) => {
+app.post('/process-file', async (req, res) => {
   try {
-    const pubsubMessage = req.body;
-
-    if (!pubsubMessage?.message?.data) {
-      return res.status(400).json({ error: 'Invalid Pub/Sub message format' });
-    }
-
     try {
-      const payload = decodeMessage(pubsubMessage.message.data);
+      const payload = req.body;
       await processConversion(payload);
       res.status(200).json({ success: true, uuid: payload.uuid });
     } catch (error) {
@@ -290,17 +284,17 @@ app.get('/readiness', (req, res) => {
  * Start server
  */
 app.listen(config.port, () => {
-  console.log(`🚀 Cloud Run service listening on port ${config.port}`);
+  console.log(`Cloud Run service listening on port ${config.port}`);
   console.log(`R2 Bucket: ${config.bucket}`);
   console.log(`  Input prefix: ${config.inputPrefix}`);
   console.log(`  Output prefix: ${config.outputPrefix}`);
   console.log(`Cloudflare Worker URL: ${config.cloudflareWorkerUrl}`);
   if (config.testMode) {
-    console.log(`⚠️  TEST MODE: R2 operations are mocked`);
+    console.log(` TEST MODE: R2 operations are mocked`);
   } else {
-    console.log(`✅ Connected to R2 bucket`);
-    console.log(`✅ Connected to Cloudflare Worker for status updates`);
-    console.log(`✅ Using LibreOffice for DOCX to PDF conversion`);
+    console.log(`Connected to R2 bucket`);
+    console.log(`Connected to Cloudflare Worker for status updates`);
+    console.log(`Using LibreOffice for DOCX to PDF conversion`);
   }
 });
 
