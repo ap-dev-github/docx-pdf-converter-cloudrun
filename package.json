@@ -3,7 +3,6 @@
   "version": "2.0.0",
   "description": "Production DOCX to PDF converter with R2 storage and Pub/Sub integration",
   "main": "index.js",
-  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
