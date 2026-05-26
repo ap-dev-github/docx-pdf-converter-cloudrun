@@ -7,9 +7,9 @@ const path = require('path');
 // Configuration
 const config = {
   bucket: process.env.R2_BUCKET || 'yellow-ai',
-  inputPrefix: process.env.R2_INPUT_PREFIX || 'yellow-ai-unconverter',
-  outputPrefix: process.env.R2_OUTPUT_PREFIX || 'yellow-ai-converter',
-  r2Endpoint: process.env.R2_ENDPOINT || 'https://your-account.r2.cloudflarestorage.com',
+  inputPrefix: process.env.R2_INPUT_PREFIX || 'yellow-ai-unconverted',
+  outputPrefix: process.env.R2_OUTPUT_PREFIX || 'yellow-ai-converted',
+  r2Endpoint: process.env.R2_ENDPOINT || '',
   r2AccessKeyId: process.env.R2_ACCESS_KEY_ID || '',
   r2SecretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
   port: parseInt(process.env.PORT || '8080'),
