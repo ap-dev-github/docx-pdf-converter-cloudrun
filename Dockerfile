@@ -31,7 +31,6 @@ COPY index.js .
 
 # Create temp directory for conversions
 RUN mkdir -p /tmp/docx-pdf-conversion
-
 # Expose port for Cloud Run
 EXPOSE 8080
 
