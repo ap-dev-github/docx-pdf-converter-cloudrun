@@ -27,7 +27,7 @@ COPY package.json .
 RUN npm install
 
 # Copy app files
-COPY server.js .
+COPY index.js .
 
 # Create temp directory for conversions
 RUN mkdir -p /tmp/docx-pdf-conversion
