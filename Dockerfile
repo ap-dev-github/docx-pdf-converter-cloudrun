@@ -1,11 +1,12 @@
-# Base Node.js image
 FROM node:20-slim
 
-# Install LibreOffice and comprehensive font support
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libreoffice-core \
         libreoffice-writer \
+        python3 \
+        python3-pip \
+        python3-uno \
         fonts-dejavu-core \
         fonts-dejavu \
         fonts-liberation \
@@ -18,26 +19,29 @@ RUN apt-get update && \
         xfonts-75dpi \
         xfonts-100dpi \
         wget curl unzip \
-        && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Pre-warm LibreOffice user profile and font cache at BUILD time
+# This bakes the profile into the image so every container starts warm
+RUN mkdir -p /opt/lo-profile && \
+    echo "Pre-warming LibreOffice profile..." && \
+    soffice --headless --invisible \
+        -env:UserInstallation=file:///opt/lo-profile \
+        --convert-to pdf --outdir /tmp /dev/null 2>/dev/null || true && \
+    echo "Profile warm complete"
 
 WORKDIR /app
 
-# Copy production package files
 COPY package.json .
-
 RUN npm install
 
-# Copy app files
 COPY index.js .
 
-# Create temp directory for conversions
 RUN mkdir -p /tmp/docx-pdf-conversion
-# Expose port for Cloud Run
+
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Start production server
-CMD ["npm", "start"]
+CMD ["node", "index.js"]

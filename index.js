@@ -32,6 +32,7 @@ const s3Client = new S3Client({
 });
 
 const TEMP_DIR = '/tmp/docx-pdf-conversion';
+const LO_PROFILE = 'file:///opt/lo-profile';
 
 // Create temp directory if it doesn't exist
 if (!fs.existsSync(TEMP_DIR)) {
@@ -121,23 +122,41 @@ async function downloadFromR2(uuid, logger) {
 /**
  * Convert DOCX to PDF using LibreOffice
  */
-function convertWithLibreOffice(inputPath, uuid, logger) {
+function convertDocxToPdf(inputPath, uuid, logger) {
   return new Promise((resolve, reject) => {
-    const outputDir = TEMP_DIR;
-    logger.info('Converting DOCX to PDF with LibreOffice');
-
-    exec(`libreoffice --headless --convert-to pdf --outdir ${outputDir} ${inputPath}`, (error) => {
+    const outputFile = path.join(TEMP_DIR, `${uuid}.pdf`);
+ 
+    // Use pre-warmed profile → skips profile creation and font cache scan
+    // Each conversion gets an isolated tmp HOME to avoid lock file conflicts
+    // when concurrency > 1
+    const cmd = [
+      'soffice',
+      '--headless',
+      '--invisible',
+      '--nocrashreport',
+      '--nodefault',
+      '--nofirststartwizard',
+      '--norestore',
+      `-env:UserInstallation=${LO_PROFILE}`,
+      '--convert-to pdf',
+      `--outdir "${TEMP_DIR}"`,
+      `"${inputPath}"`
+    ].join(' ');
+ 
+    logger.info('Converting DOCX → PDF');
+    const startTime = Date.now();
+ 
+    exec(cmd, { timeout: 60000 }, (error, stdout, stderr) => {
       if (error) {
-        logger.error(`LibreOffice conversion error`, error);
-        return reject(error);
+        logger.error('soffice failed', error);
+        return reject(new Error(`soffice failed: ${error.message}`));
       }
-
-      const outputFile = path.join(outputDir, `${uuid}.pdf`);
-      if (!fs.existsSync(outputFile)) {
-        return reject(new Error(`Output PDF not found: ${outputFile}`));
+ 
+      if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size === 0) {
+        return reject(new Error(`Output PDF missing or empty at ${outputFile}`));
       }
-
-      logger.info('LibreOffice conversion successful');
+ 
+      logger.success(`Converted in ${Date.now() - startTime}ms`);
       resolve(outputFile);
     });
   });
@@ -187,6 +206,7 @@ function cleanupTempFiles(logger, ...filePaths) {
 }
 
 /**
+ * 
  * Main conversion process
  */
 async function processConversion(payload) {
@@ -210,7 +230,7 @@ async function processConversion(payload) {
     inputPath = await downloadFromR2(uuid, logger);
 
     // 2. Convert DOCX to PDF with LibreOffice
-    outputPath = await convertWithLibreOffice(inputPath, uuid, logger);
+    outputPath = await convertDocxToPdf(inputPath, uuid, logger);
 
     // 3. Upload PDF to R2 output bucket
     await uploadToR2(uuid, outputPath, logger);
