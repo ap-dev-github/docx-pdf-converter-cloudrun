@@ -24,6 +24,7 @@ WORKDIR /app
 
 # Copy production package files
 COPY package.json .
+
 RUN npm install
 
 # Copy app files

@@ -7,11 +7,10 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "fastify": "^4.27.2",
-    "@aws-sdk/client-s3": "^3.400.0"
+    "@aws-sdk/client-s3": "^3.400.0",
+    "express": "^5.2.1"
   },
   "engines": {
     "node": "20.x"
   }
 }
-
