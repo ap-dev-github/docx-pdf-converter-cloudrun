@@ -1,27 +1,33 @@
 const express = require('express');
-const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { exec } = require('child_process');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const puppeteer = require('puppeteer-core');
 const fs = require('fs');
 const path = require('path');
 
-// Configuration
+// ─── Configuration ───────────────────────────────────────────────────────────
+
 const config = {
   bucket: process.env.R2_BUCKET || 'yellow-ai',
-  inputPrefix: process.env.R2_INPUT_PREFIX || 'yellow-ai-unconverted',
   outputPrefix: process.env.R2_OUTPUT_PREFIX || 'yellow-ai-converted',
   r2Endpoint: process.env.R2_ENDPOINT || '',
   r2AccessKeyId: process.env.R2_ACCESS_KEY_ID || '',
   r2SecretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
   port: parseInt(process.env.PORT || '8080'),
   testMode: process.env.NODE_ENV === 'test',
-  cloudflareWorkerUrl: process.env.CLOUDFLARE_WORKER_URL || 'https://docx-pdf-service-production.devversioncv.workers.dev',
-  docxPdfConverterSecret: process.env.DOCX_PDF_CONVERTER_SECRET || ''
+  cloudflareWorkerUrl:
+    process.env.CLOUDFLARE_WORKER_URL ||
+    'https://docx-pdf-service-production.devversioncv.workers.dev',
+  docxPdfConverterSecret: process.env.DOCX_PDF_CONVERTER_SECRET || '',
+  chromiumPath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium'
 };
 
-// Initialize
-const app = express();
+// ─── Express ─────────────────────────────────────────────────────────────────
 
-// Initialize S3 client for Cloudflare R2 (S3-compatible)
+const app = express();
+app.use(express.json({ limit: '50mb' })); // HTML payloads can be large
+
+// ─── S3 / R2 client ──────────────────────────────────────────────────────────
+
 const s3Client = new S3Client({
   region: 'auto',
   endpoint: config.r2Endpoint,
@@ -31,169 +37,193 @@ const s3Client = new S3Client({
   }
 });
 
-const TEMP_DIR = '/tmp/docx-pdf-conversion';
-const LO_PROFILE = 'file:///opt/lo-profile';
+// ─── Temp directory ──────────────────────────────────────────────────────────
 
-// Create temp directory if it doesn't exist
+const TEMP_DIR = '/tmp/html-pdf-conversion';
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
-app.use(express.json());
+// ─── Logger ──────────────────────────────────────────────────────────────────
 
-// Logger with context
 const createLogger = (uuid) => ({
-  info: (msg, data) => console.log(`[${uuid}] ℹ ${msg}`, data ? JSON.stringify(data) : ''),
-  error: (msg, err) => console.error(`[${uuid}]  ${msg}`, err ? err.message : ''),
-  success: (msg) => console.log(`[${uuid}] ${msg}`)
+  info: (msg, data) =>
+    console.log(`[${uuid}] ℹ ${msg}`, data ? JSON.stringify(data) : ''),
+  error: (msg, err) =>
+    console.error(`[${uuid}] ✖ ${msg}`, err ? err.message : ''),
+  success: (msg) => console.log(`[${uuid}] ✔ ${msg}`)
 });
 
-/**
- * Decode Base64 Pub/Sub message
- */
-function decodeMessage(data) {
-  const json = Buffer.from(data, 'base64').toString('utf-8');
-  return JSON.parse(json);
+// ─── Browser singleton ───────────────────────────────────────────────────────
+//
+// A single Chromium process is launched once when the server starts and reused
+// for every request.  Each request opens a fresh Page (tab), converts, then
+// closes that page.  This eliminates the ~1-2 s browser-launch overhead per
+// request while keeping memory usage bounded (pages are released after use).
+//
+// If the browser crashes for any reason, `browserReady` is reset to null and
+// the next request re-launches it automatically.
+
+let browser = null;
+let browserReady = null; // Promise while launching, null when idle-ready
+
+const CHROMIUM_ARGS = [
+  '--no-sandbox',               // required inside containers
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',    // /dev/shm is small in Docker; use /tmp instead
+  '--disable-gpu',
+  '--no-zygote',                // saves ~30 MB RAM in single-process containers
+  '--disable-extensions',
+  '--disable-background-networking',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-breakpad',
+  '--disable-component-extensions-with-background-pages',
+  '--disable-features=TranslateUI',
+  '--disable-ipc-flooding-protection',
+  '--disable-renderer-backgrounding',
+  '--metrics-recording-only',
+  '--mute-audio',
+  '--no-default-browser-check',
+  '--no-first-run',
+  '--safebrowsing-disable-auto-update'
+];
+
+async function launchBrowser() {
+  if (browserReady) return browserReady; // already launching, share the promise
+
+  console.log('[browser] Launching Chromium...');
+  browserReady = puppeteer
+    .launch({
+      executablePath: config.chromiumPath,
+      headless: true,
+      args: CHROMIUM_ARGS,
+      // Pipe avoids an extra IPC socket in some environments
+      pipe: true
+    })
+    .then((b) => {
+      browser = b;
+      browserReady = null; // clear the "launching" gate
+
+      // Handle unexpected crashes so the next request can recover
+      b.on('disconnected', () => {
+        console.error('[browser] Chromium disconnected — will relaunch on next request');
+        browser = null;
+        browserReady = null;
+      });
+
+      console.log('[browser] Chromium ready');
+      return b;
+    })
+    .catch((err) => {
+      console.error('[browser] Failed to launch Chromium:', err.message);
+      browserReady = null;
+      browser = null;
+      throw err;
+    });
+
+  return browserReady;
 }
 
+async function getBrowser() {
+  if (browser) return browser;
+  return launchBrowser();
+}
+
+// ─── PDF conversion ──────────────────────────────────────────────────────────
+
 /**
- * Update conversion status in Cloudflare D1 database
+ * Render `html` to a PDF buffer using the shared Chromium instance.
+ *
+ * @param {string} html   Full HTML string to render
+ * @param {string} uuid   Job ID (for logging)
+ * @param {object} logger Logger instance
+ * @returns {Promise<Buffer>} PDF bytes
  */
+async function convertHtmlToPdf(html, uuid, logger) {
+  const startTime = Date.now();
+  logger.info('Converting HTML → PDF');
+
+  const b = await getBrowser();
+  const page = await b.newPage();
+
+  try {
+    // Emulate print media so @media print CSS rules apply
+    await page.emulateMediaType('print');
+
+    // setContent is faster than goto(data:…) for large HTML strings.
+    // 'networkidle0' waits for all network requests to finish (web fonts, etc.)
+    // Switch to 'domcontentloaded' if your HTML is fully self-contained.
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
+
+    const pdfBuffer = await page.pdf({
+      format: 'A4',
+      printBackground: true,      // render background colours & images
+      preferCSSPageSize: true,    // honour @page { size: … } in the HTML
+      displayHeaderFooter: false,
+      margin: { top: '0', right: '0', bottom: '0', left: '0' }
+    });
+
+    logger.success(`Converted in ${Date.now() - startTime}ms — ${pdfBuffer.length} bytes`);
+    return Buffer.from(pdfBuffer);
+  } finally {
+    // Always close the page (tab) to free memory, even on error
+    await page.close().catch(() => {});
+  }
+}
+
+// ─── R2 upload ───────────────────────────────────────────────────────────────
+
+/**
+ * Upload a PDF buffer to R2 and return the final object key.
+ */
+async function uploadToR2(uuid, pdfBuffer, logger) {
+  const key = `${config.outputPrefix}/${uuid}.pdf`;
+  logger.info('Uploading PDF to R2', { key, bytes: pdfBuffer.length });
+
+  await s3Client.send(
+    new PutObjectCommand({
+      Bucket: config.bucket,
+      Key: key,
+      Body: pdfBuffer,
+      ContentType: 'application/pdf',
+      Metadata: { source: 'html-pdf-converter' }
+    })
+  );
+
+  logger.success('PDF uploaded to R2');
+  return key;
+}
+
+// ─── Status update ───────────────────────────────────────────────────────────
+
 async function updateConversionStatus(uuid, status, error) {
   try {
-    const payload = {
-      uuid,
-      status,
-      ...(error && { error })
-    };
+    const payload = { uuid, status, ...(error && { error }) };
 
     const response = await fetch(`${config.cloudflareWorkerUrl}/update`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${config.docxPdfConverterSecret}`
+        Authorization: `Bearer ${config.docxPdfConverterSecret}`
       },
       body: JSON.stringify(payload)
     });
 
     if (!response.ok) {
-      throw new Error(`Update failed: ${response.status} ${response.statusText}`);
+      throw new Error(`${response.status} ${response.statusText}`);
     }
 
-    const result = await response.json();
-    console.log(`[${uuid}] Status updated in D1:`, result);
+    console.log(`[${uuid}] Status updated in D1:`, await response.json());
   } catch (err) {
     console.error(`[${uuid}] Failed to update status in D1:`, err.message);
   }
 }
 
-/**
- * Download file from R2 bucket using S3 client
- */
-async function downloadFromR2(uuid, logger) {
-  try {
-    const key = `${config.inputPrefix}/${uuid}.docx`;
-    logger.info('Downloading DOCX from R2 bucket');
+// ─── Cleanup ─────────────────────────────────────────────────────────────────
 
-    const command = new GetObjectCommand({
-      Bucket: config.bucket,
-      Key: key
-    });
-
-    const response = await s3Client.send(command);
-
-    // Convert stream to buffer
-    const chunks = [];
-    for await (const chunk of response.Body) {
-      chunks.push(chunk);
-    }
-
-    const buffer = Buffer.concat(chunks);
-    const localPath = path.join(TEMP_DIR, `${uuid}.docx`);
-    fs.writeFileSync(localPath, buffer);
-
-    logger.info(`Downloaded DOCX`, { size: buffer.length });
-    return localPath;
-  } catch (error) {
-    throw new Error(`Failed to download from R2: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-/**
- * Convert DOCX to PDF using LibreOffice
- */
-function convertDocxToPdf(inputPath, uuid, logger) {
-  return new Promise((resolve, reject) => {
-    const outputFile = path.join(TEMP_DIR, `${uuid}.pdf`);
- 
-    // Use pre-warmed profile → skips profile creation and font cache scan
-    // Each conversion gets an isolated tmp HOME to avoid lock file conflicts
-    // when concurrency > 1
-    const cmd = [
-      'soffice',
-      '--headless',
-      '--invisible',
-      '--nocrashreport',
-      '--nodefault',
-      '--nofirststartwizard',
-      '--norestore',
-      `-env:UserInstallation=${LO_PROFILE}`,
-      '--convert-to pdf',
-      `--outdir "${TEMP_DIR}"`,
-      `"${inputPath}"`
-    ].join(' ');
- 
-    logger.info('Converting DOCX → PDF');
-    const startTime = Date.now();
- 
-    exec(cmd, { timeout: 60000 }, (error, stdout, stderr) => {
-      if (error) {
-        logger.error('soffice failed', error);
-        return reject(new Error(`soffice failed: ${error.message}`));
-      }
- 
-      if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size === 0) {
-        return reject(new Error(`Output PDF missing or empty at ${outputFile}`));
-      }
- 
-      logger.success(`Converted in ${Date.now() - startTime}ms`);
-      resolve(outputFile);
-    });
-  });
-}
-
-/**
- * Upload file to R2 bucket using S3 client
- */
-async function uploadToR2(uuid, localPath, logger) {
-  try {
-    const key = `${config.outputPrefix}/${uuid}.pdf`;
-    const fileBuffer = fs.readFileSync(localPath);
-
-    logger.info('Uploading PDF to R2 bucket');
-
-    const command = new PutObjectCommand({
-      Bucket: config.bucket,
-      Key: key,
-      Body: fileBuffer,
-      ContentType: 'application/pdf',
-      Metadata: {
-        'source': 'docx-pdf-converter'
-      }
-    });
-
-    await s3Client.send(command);
-    logger.success('PDF uploaded to R2');
-  } catch (error) {
-    throw new Error(`Failed to upload to R2: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-/**
- * Clean up temporary files
- */
 function cleanupTempFiles(logger, ...filePaths) {
-  filePaths.forEach(filePath => {
+  for (const filePath of filePaths) {
     if (filePath && fs.existsSync(filePath)) {
       try {
         fs.unlinkSync(filePath);
@@ -202,126 +232,163 @@ function cleanupTempFiles(logger, ...filePaths) {
         logger.error(`Failed to clean up ${filePath}`, err);
       }
     }
-  });
+  }
 }
 
-/**
- * 
- * Main conversion process
- */
+// ─── Main conversion orchestrator ────────────────────────────────────────────
+
 async function processConversion(payload) {
-  const uuid = payload.uuid;
+  const { uuid, html } = payload;
   const logger = createLogger(uuid);
   const startTime = Date.now();
-  let inputPath = null;
-  let outputPath = null;
+  let tempPdfPath = null;
 
   try {
-    logger.info('Starting conversion', { bucket_path: payload.bucket_path });
+    logger.info('Starting conversion');
 
-    // In test mode, skip R2 operations and just return success
+    if (!html || typeof html !== 'string' || html.trim().length === 0) {
+      throw new Error('Payload missing required field: html (non-empty string)');
+    }
+
+    // Test mode: skip heavy operations, just validate input
     if (config.testMode) {
-      logger.info('TEST MODE: Skipping R2 operations');
+      logger.info('TEST MODE: Skipping Chromium and R2 operations');
       logger.success(`Test conversion complete in ${Date.now() - startTime}ms`);
       return;
     }
 
-    // 1. Download DOCX from R2
-    inputPath = await downloadFromR2(uuid, logger);
+    // 1. Render HTML → PDF buffer (Chromium via Puppeteer)
+    const pdfBuffer = await convertHtmlToPdf(html, uuid, logger);
 
-    // 2. Convert DOCX to PDF with LibreOffice
-    outputPath = await convertDocxToPdf(inputPath, uuid, logger);
+    // 2. Optionally write to disk (useful for debugging; skipped in prod)
+    //    Uncomment if you need a local copy for troubleshooting:
+    // tempPdfPath = path.join(TEMP_DIR, `${uuid}.pdf`);
+    // fs.writeFileSync(tempPdfPath, pdfBuffer);
 
-    // 3. Upload PDF to R2 output bucket
-    await uploadToR2(uuid, outputPath, logger);
+    // 3. Upload PDF to R2
+    await uploadToR2(uuid, pdfBuffer, logger);
 
-    // 4. Update status to completed in Cloudflare D1
-    const duration = Date.now() - startTime;
-    logger.info('Updating conversion status in D1');
+    // 4. Mark completed in Cloudflare D1
     await updateConversionStatus(uuid, 'completed');
-    logger.success(`Conversion complete in ${duration}ms`);
-
+    logger.success(`Conversion complete in ${Date.now() - startTime}ms`);
   } catch (error) {
-    const duration = Date.now() - startTime;
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logger.error(`Conversion failed after ${duration}ms: ${errorMsg}`, error);
-
-    // Update status to failed in Cloudflare D1
+    logger.error(`Conversion failed after ${Date.now() - startTime}ms: ${errorMsg}`, error);
     await updateConversionStatus(uuid, 'failed', errorMsg);
-
     throw error;
   } finally {
-    // Always clean up temporary files
-    cleanupTempFiles(logger, inputPath, outputPath);
+    cleanupTempFiles(logger, tempPdfPath);
   }
 }
 
+// ─── Routes ──────────────────────────────────────────────────────────────────
+
 /**
- * Incoming process file request handler
+ * POST /process-file
+ * Body: { uuid: string, html: string }
  */
 app.post('/process-file', async (req, res) => {
   try {
-    try {
-      const payload = req.body;
-      await processConversion(payload);
-      res.status(200).json({ success: true, uuid: payload.uuid });
-    } catch (error) {
-      // Return 500 for Pub/Sub retry
-      console.error('Processing error:', error);
-      res.status(500).json({
-        error: 'Processing failed',
-        message: error instanceof Error ? error.message : String(error)
-      });
+    const payload = req.body;
+
+    if (!payload || !payload.uuid) {
+      return res.status(400).json({ error: 'Missing required field: uuid' });
     }
+
+    await processConversion(payload);
+    res.status(200).json({ success: true, uuid: payload.uuid });
   } catch (error) {
-    console.error('Request error:', error);
-    res.status(400).json({ error: 'Invalid request' });
+    console.error('Processing error:', error);
+    res.status(500).json({
+      error: 'Processing failed',
+      message: error instanceof Error ? error.message : String(error)
+    });
   }
 });
 
-/**
- * Health check endpoint
- */
-app.get('/health', (req, res) => {
+// **
+//  * POST /convert
+//  * LOCAL / DEV ONLY — returns the PDF as raw bytes in the response.
+//  * No R2 upload, no status update. Great for smoke-testing the container.
+//  * Body: { html: string }
+//  */
+app.post('/convert', async (req, res) => {
+  const startTime = Date.now();
+  const { html } = req.body || {};
+ 
+  if (!html || typeof html !== 'string' || html.trim().length === 0) {
+    return res.status(400).json({ error: 'Missing required field: html (non-empty string)' });
+  }
+ 
+  const logger = createLogger('local-convert');
+ 
+  try {
+    const pdfBuffer = await convertHtmlToPdf(html, 'local-convert', logger);
+    const ms = Date.now() - startTime;
+ 
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': 'attachment; filename="output.pdf"',
+      'Content-Length': pdfBuffer.length,
+      'X-Conversion-Ms': ms
+    });
+ 
+    logger.success(`/convert done in ${ms}ms — ${pdfBuffer.length} bytes`);
+    res.send(pdfBuffer);
+  } catch (error) {
+    logger.error('Conversion failed', error);
+    res.status(500).json({
+      error: 'Conversion failed',
+      message: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+/** GET /health */
+app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
-    service: 'docx-pdf-converter',
+    service: 'html-pdf-converter',
+    browserReady: browser !== null,
     timestamp: new Date().toISOString()
   });
 });
 
-/**
- * Ready check for Cloud Run
- */
-app.get('/readiness', (req, res) => {
-  res.json({
-    ready: true,
-    timestamp: new Date().toISOString()
-  });
+/** GET /readiness — Cloud Run startup probe */
+app.get('/readiness', (_req, res) => {
+  // Report not-ready until the browser is up
+  if (!browser) {
+    return res.status(503).json({ ready: false, reason: 'browser not ready' });
+  }
+  res.json({ ready: true, timestamp: new Date().toISOString() });
 });
 
-/**
- * Start server
- */
-app.listen(config.port, () => {
-  console.log(`Cloud Run service listening on port ${config.port}`);
-  console.log(`R2 Bucket: ${config.bucket}`);
-  console.log(`  Input prefix: ${config.inputPrefix}`);
-  console.log(`  Output prefix: ${config.outputPrefix}`);
-  console.log(`Cloudflare Worker URL: ${config.cloudflareWorkerUrl}`);
+// ─── Server startup ──────────────────────────────────────────────────────────
+
+app.listen(config.port, async () => {
+  console.log(`HTML→PDF converter listening on port ${config.port}`);
+  console.log(`R2 bucket: ${config.bucket}  output prefix: ${config.outputPrefix}`);
+  console.log(`Cloudflare Worker: ${config.cloudflareWorkerUrl}`);
+
   if (config.testMode) {
-    console.log(` TEST MODE: R2 operations are mocked`);
-  } else {
-    console.log(`Connected to R2 bucket`);
-    console.log(`Connected to Cloudflare Worker for status updates`);
-    console.log(`Using LibreOffice for DOCX to PDF conversion`);
+    console.log('⚠  TEST MODE: Chromium and R2 operations are mocked');
+    return;
+  }
+
+  // Pre-launch Chromium so the first real request is instant
+  try {
+    await launchBrowser();
+  } catch (err) {
+    console.error('Chromium pre-launch failed (will retry on first request):', err.message);
   }
 });
 
-/**
- * Graceful shutdown
- */
-process.on('SIGTERM', () => {
-  console.log('SIGTERM signal received: closing HTTP server');
+// ─── Graceful shutdown ───────────────────────────────────────────────────────
+
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received — shutting down');
+  if (browser) {
+    await browser.close().catch(() => {});
+  }
   process.exit(0);
 });
