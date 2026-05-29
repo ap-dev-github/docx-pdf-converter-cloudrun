@@ -245,7 +245,7 @@ async function processConversion(payload) {
 
   try {
     logger.info('Starting conversion');
-    logger.info('html recived'= JSON.stringify(html));
+   logger.info('html received', JSON.stringify(html));
 
     if (!html || typeof html !== 'string' || html.trim().length === 0) {
       throw new Error('Payload missing required field: html (non-empty string)');
